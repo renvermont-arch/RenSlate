@@ -211,11 +211,28 @@
             </div>
           </div>
 
+          <div class="settings-card">
+            <h3 class="settings-card-title">Speech Diagnostics</h3>
+            <p class="settings-card-desc">If voice input isn't working, tap the mic once, then copy this report.</p>
+            <pre class="diag-output" id="diag-output" aria-live="polite"></pre>
+            <div class="diag-actions">
+              <button id="diag-refresh-btn" class="card-action-pill subtle-pill" title="Refresh report">Refresh</button>
+              <button id="diag-copy-btn" class="card-action-pill subtle-pill" title="Copy report">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                <span class="copy-label">Copy</span>
+              </button>
+            </div>
+          </div>
+
           <div class="settings-card tip-card">
             <h3 class="settings-card-title">Microphone Tip</h3>
             <p class="settings-card-desc">
-              For best voice recognition, use Google Chrome on desktop or Android and ensure your microphone permission is set to <strong>Allow</strong>.
-              The app shell works offline after the first load; translation itself needs an internet connection.
+              For best voice recognition, use Google Chrome on desktop or Android and set microphone permission to <strong>Allow</strong>.
+              On a phone the app must be opened over <strong>HTTPS</strong> (not a plain http:// LAN address) — browsers block voice input on insecure pages.
+              The app shell works offline after the first load; translation and speech recognition need an internet connection.
             </p>
           </div>
         </div>

@@ -9,7 +9,7 @@
  * - Other cross-origin requests (e.g. fonts): left to the browser.
  */
 
-const CACHE_NAME = 'voice-translator-v5';
+const CACHE_NAME = 'voice-translator-v6';
 const INDEX_URL = new URL('./index.html', self.location.href).href;
 
 const ASSETS_TO_CACHE = [

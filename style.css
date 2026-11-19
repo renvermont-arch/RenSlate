@@ -929,6 +929,27 @@ html, body {
   background-color: rgba(59, 130, 246, 0.1);
 }
 
+.diag-output {
+  background-color: rgba(127, 127, 127, 0.08);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.66rem;
+  line-height: 1.45;
+  padding: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.diag-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .tip-card {
   border-color: rgba(59, 130, 246, 0.2);
   background-color: rgba(59, 130, 246, 0.04);

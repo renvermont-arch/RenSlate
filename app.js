@@ -28,6 +28,9 @@ const TRANSLATION_TIMEOUT_MS = 12000;
 const TRANSLATION_CHUNK_SIZE = 480;
 const AUTO_TRANSLATE_DELAY_MS = 900;
 const FINALIZE_FALLBACK_MS = 1500;
+const MAX_SPEECH_RESTARTS = 4;
+const SPEECH_RESTART_DELAY_MS = 250;
+const DIAG_LOG_LIMIT = 40;
 
 const elements = {
   // Navigation & Views
@@ -78,6 +81,9 @@ const elements = {
   languageGuideList: document.getElementById('language-guide-list'),
   languageCount: document.getElementById('language-count'),
   themeOptions: document.getElementById('theme-options'),
+  diagOutput: document.getElementById('diag-output'),
+  diagRefreshBtn: document.getElementById('diag-refresh-btn'),
+  diagCopyBtn: document.getElementById('diag-copy-btn'),
 
   // Notification Toast
   toast: document.getElementById('toast')
@@ -109,7 +115,16 @@ const state = {
   theme: 'dark',
   systemThemeMedia: window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null,
   historyClearArmed: false,
-  historyClearTimer: null
+  historyClearTimer: null,
+
+  // Speech session tracking (needed because Android Chrome ends sessions early)
+  baseTranscript: '',
+  sessionFinalCount: 0,
+  restartCount: 0,
+  restartTimer: null,
+  lastSpeechError: '',
+  micPermission: 'unknown',
+  diagLog: []
 };
 
 // ==========================================================================
@@ -179,6 +194,9 @@ function refreshAppStatus() {
   } else if (state.isTranslating) {
     text = 'Translating';
     className += ' translating';
+  } else if (!window.isSecureContext) {
+    text = 'Needs HTTPS';
+    className += ' offline';
   } else if (!state.isOnline) {
     text = 'Offline';
     className += ' offline';
@@ -226,6 +244,60 @@ function updateCharCount() {
   elements.sourceCharCount.textContent = `${count} character${count === 1 ? '' : 's'}`;
 }
 
+/** Human-readable snapshot of the browser conditions that affect voice input. */
+function diagnosticSummary() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const isStandalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+
+  return [
+    `Time:        ${new Date().toLocaleString()}`,
+    `Page:        ${location.href}`,
+    `PWA mode:    ${isStandalone ? 'yes' : 'no'}`,
+    `Secure ctx:  ${window.isSecureContext} (voice input requires true)`,
+    `Online:      ${navigator.onLine}`,
+    `Speech API:  ${SpeechRecognition ? 'available' : 'MISSING'}`,
+    `getUserMedia:${navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? ' available' : ' MISSING'}`,
+    `Mic perm:    ${state.micPermission}`,
+    `Last error:  ${state.lastSpeechError || 'none'}`,
+    `Browser:     ${navigator.userAgent}`
+  ].join('\n');
+}
+
+/** Rebuilds the diagnostics panel from the current summary and event log. */
+function renderDiagnostics() {
+  if (!elements.diagOutput) return;
+  const events = state.diagLog.length ? state.diagLog.join('\n') : '(no events yet — tap the mic and speak)';
+  elements.diagOutput.textContent = `${diagnosticSummary()}\n\n--- events ---\n${events}`;
+}
+
+/** Appends a timestamped line to the diagnostics panel. */
+function logDiag(message) {
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  state.diagLog.push(`[${time}] ${message}`);
+  if (state.diagLog.length > DIAG_LOG_LIMIT) state.diagLog.shift();
+  renderDiagnostics();
+}
+
+/** Queries microphone permission when the browser supports it. */
+async function queryMicPermission() {
+  if (!navigator.permissions || !navigator.permissions.query) {
+    state.micPermission = 'unknown (no Permissions API)';
+    renderDiagnostics();
+    return;
+  }
+  try {
+    const result = await navigator.permissions.query({ name: 'microphone' });
+    state.micPermission = result.state;
+    result.onchange = () => {
+      state.micPermission = result.state;
+      logDiag(`mic permission changed: ${result.state}`);
+    };
+  } catch (e) {
+    state.micPermission = 'unknown (' + (e && e.name ? e.name : 'error') + ')';
+  }
+  renderDiagnostics();
+}
+
 /** Escapes HTML for safe insertion into innerHTML templates. */
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
@@ -249,142 +321,220 @@ function initSpeechRecognition() {
     state.speechRecognitionSupported = false;
     elements.micBtn.disabled = true;
     elements.micStatusLabel.textContent = 'Voice input needs Chrome or Edge';
+    logDiag('SpeechRecognition is MISSING in this browser.');
     showToast('Speech recognition is not supported in this browser. You can still type text.', true);
     return;
   }
 
   state.speechRecognitionSupported = true;
-  state.recognitionInstance = new SpeechRecognition();
-  state.recognitionInstance.continuous = true;
-  state.recognitionInstance.interimResults = true;
-  state.recognitionInstance.maxAlternatives = 1;
+  const recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.maxAlternatives = 1;
+  state.recognitionInstance = recognition;
 
-  // Real-time transcription results
-  state.recognitionInstance.onresult = (event) => {
-    const finalParts = [];
-    const interimParts = [];
+  logDiag(`SpeechRecognition available (continuous=${recognition.continuous})`);
 
+  recognition.onstart = () => {
+    logDiag('onstart');
+    elements.micStatusLabel.textContent = 'Listening… tap to stop';
+  };
+
+  // Real-time transcription results. `event.results` is cumulative, so only
+  // newly-final results are appended to the session transcript.
+  recognition.onresult = (event) => {
+    let lastFinalIndex = -1;
     for (let i = 0; i < event.results.length; i++) {
-      const result = event.results[i];
-      const transcript = result[0] && result[0].transcript ? result[0].transcript.trim() : '';
-      if (!transcript) continue;
-      (result.isFinal ? finalParts : interimParts).push(transcript);
+      if (event.results[i].isFinal) lastFinalIndex = i;
     }
 
-    const combined = [...finalParts, ...interimParts].join(' ');
+    const newFinals = [];
+    for (let i = state.sessionFinalCount; i <= lastFinalIndex; i++) {
+      const transcript = event.results[i][0] && event.results[i][0].transcript
+        ? event.results[i][0].transcript.trim()
+        : '';
+      if (transcript) newFinals.push(transcript);
+    }
+    state.sessionFinalCount = Math.max(state.sessionFinalCount, lastFinalIndex + 1);
+
+    const interims = [];
+    for (let i = state.sessionFinalCount; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (result.isFinal) continue;
+      const transcript = result[0] && result[0].transcript ? result[0].transcript.trim() : '';
+      if (transcript) interims.push(transcript);
+    }
+
+    if (newFinals.length) {
+      state.baseTranscript = [state.baseTranscript, newFinals.join(' ')].filter(Boolean).join(' ');
+      state.restartCount = 0; // Speech is flowing; reset the auto-restart budget.
+    }
+
+    const combined = [state.baseTranscript, interims.join(' ')].filter(Boolean).join(' ');
+    logDiag(`onresult final="${newFinals.join(' ')}" interim="${interims.join(' ')}"`);
+
     if (combined) {
       elements.sourceText.value = combined;
       elements.translationText.value = '';
       updateCharCount();
       updateActionButtons();
+      elements.micStatusLabel.textContent = 'Listening… tap to stop';
     }
   };
 
   // Handles recognition errors
-  state.recognitionInstance.onerror = (event) => {
-    console.warn('Speech recognition error:', event.error);
+  recognition.onerror = (event) => {
+    const code = event.error || 'unknown';
+    state.lastSpeechError = code;
+    console.warn('Speech recognition error:', code);
+    logDiag(`onerror: ${code}`);
 
-    switch (event.error) {
+    switch (code) {
       case 'not-allowed':
       case 'service-not-allowed':
         abortRecording();
-        showToast('Microphone access denied. Allow it in your browser settings.', true);
+        showToast(`Microphone blocked (${code}). Allow mic access for this site.`, true);
         break;
       case 'audio-capture':
-        abortRecording();
-        showToast('No microphone was found. Connect one and try again.', true);
+        // A second mic stream (our waveform) may be holding the microphone.
+        stopWaveform();
+        logDiag('Stopped waveform stream after audio-capture error');
         break;
       case 'network':
         abortRecording();
-        showToast('Network error during speech recognition.', true);
+        showToast(`Speech service needs internet (${code}). Check your connection.`, true);
         break;
       case 'no-speech':
-        // onend will finalize and show the "no speech" message.
+        showToast('No speech heard yet — keep talking, or tap the mic to stop.');
         break;
       case 'aborted':
-        // Intentional stop - onend handles cleanup.
         break;
       default:
-        showToast('Speech recognition error. Please try again.', true);
+        logDiag(`Unhandled speech error: ${code}`);
     }
   };
 
-  // Fires when recognition ends, either manually or by the browser
-  state.recognitionInstance.onend = () => {
-    finalizeRecording();
+  // Chrome on Android frequently ends a session after a short pause even with
+  // continuous=true. Restart while the user still intends to record.
+  recognition.onend = () => {
+    logDiag('onend');
+
+    if (state.finalizePending) {
+      finalizeRecording();
+      return;
+    }
+    if (!state.isRecording) return;
+
+    if (state.restartCount < MAX_SPEECH_RESTARTS) {
+      state.restartCount++;
+      logDiag(`Auto-restarting (${state.restartCount}/${MAX_SPEECH_RESTARTS})`);
+      elements.micStatusLabel.textContent = 'Listening… tap to stop';
+
+      clearTimeout(state.restartTimer);
+      state.restartTimer = setTimeout(() => {
+        state.restartTimer = null;
+        if (!state.isRecording || state.finalizePending) return;
+        try {
+          recognition.start();
+          logDiag('restart start() called');
+        } catch (e) {
+          logDiag(`restart failed: ${e.name}`);
+          finalizeRecording();
+        }
+      }, SPEECH_RESTART_DELAY_MS);
+    } else {
+      logDiag('Restart limit reached; finalizing');
+      finalizeRecording();
+    }
   };
 }
 
-/** Starts recording audio and transcribing speech. */
+/** Starts recording and transcribing speech. */
 async function startRecording() {
   if (!state.speechRecognitionSupported) {
     showToast('Voice input requires Chrome or Edge. You can type instead.', true);
     return;
   }
   if (state.isStarting || state.isRecording || state.finalizePending) return;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showToast('Microphone access requires a secure (HTTPS or localhost) page.', true);
-    return;
-  }
 
   state.isStarting = true;
   elements.micBtn.disabled = true;
+  clearTimeout(state.restartTimer);
+  state.restartTimer = null;
+  state.baseTranscript = '';
+  state.sessionFinalCount = 0;
+  state.restartCount = 0;
+  state.lastSpeechError = '';
+  logDiag('startRecording() called');
   refreshAppStatus();
 
-  let stream = null;
   try {
-    // 1. Request microphone access for the AudioContext waveform
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true },
-      video: false
-    });
-
-    // Guard against a stale async completion
-    if (!state.isStarting) {
-      stream.getTracks().forEach(track => track.stop());
-      return;
-    }
-
-    state.mediaStream = stream;
-
-    // 2. Match recognition language to the "From" selector
     const fromLang = getLanguage(elements.fromLangSelect.value);
     state.recognitionInstance.lang = fromLang.speechCode;
+    logDiag(`recognition.lang = ${fromLang.speechCode}`);
 
-    // 3. Start waveform visualization
-    startWaveform(stream);
-
-    // 4. Start speech recognition
+    // IMPORTANT: start() must happen inside the tap handler (no await before it).
+    // Mobile browsers reject speech recognition started after an async gap.
     state.recognitionInstance.start();
+    logDiag('start() called');
 
-    // 5. Update state and UI
     state.isStarting = false;
     state.isRecording = true;
     setListeningUI(true);
 
-    // 6. Prepare for fresh input
     cancelPendingTranslation();
+    elements.sourceText.value = '';
     elements.translationText.value = '';
     elements.translationCard.classList.remove('has-error');
-    announce('');
+    updateCharCount();
     updateActionButtons();
+    announce('');
+
+    // The waveform is decorative: a second microphone stream on a phone can
+    // interfere with recognition, so only open it on pointer (desktop) devices.
+    const isTouchDevice = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+    if (isTouchDevice) {
+      logDiag('Waveform skipped on touch device (avoids mic conflict)');
+    } else {
+      startOptionalWaveform();
+    }
 
   } catch (err) {
+    logDiag(`start failed: ${err.name}: ${err.message}`);
     console.error('Error starting recording:', err);
-    // Clean up everything, even if recognition never actually started.
-    if (stream) stream.getTracks().forEach(track => track.stop());
     cleanupRecordingResources();
-    if (err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
-      showToast('Microphone permission was denied. Please allow access.', true);
-    } else if (err && err.name === 'NotReadableError') {
-      showToast('The microphone is busy. Close other apps using it.', true);
+
+    if (err.name === 'InvalidStateError') {
+      showToast('Microphone is already running. Tap stop first.', true);
+    } else if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+      showToast('Voice input is blocked. Open the app over HTTPS and allow microphone access.', true);
     } else {
-      showToast('Could not start the microphone. Please check your settings.', true);
+      showToast(`Could not start voice input (${err.name}). See Settings → Speech diagnostics.`, true);
     }
   } finally {
     state.isStarting = false;
     elements.micBtn.disabled = false;
     refreshAppStatus();
+  }
+}
+
+/** Opens a microphone stream for the waveform. Failure never blocks dictation. */
+async function startOptionalWaveform() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    logDiag('getUserMedia unavailable; waveform disabled');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    if (!state.isRecording) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    state.mediaStream = stream;
+    startWaveform(stream);
+    logDiag('Waveform microphone stream started');
+  } catch (e) {
+    logDiag(`Waveform unavailable: ${e.name}`);
   }
 }
 
@@ -394,6 +544,8 @@ function stopRecording() {
 
   state.isRecording = false;
   state.finalizePending = true;
+  clearTimeout(state.restartTimer);
+  state.restartTimer = null;
   stopRecognition();
   stopWaveform();
   setListeningUI(false);
@@ -409,7 +561,9 @@ function finalizeRecording() {
   if (!state.finalizePending && !state.isRecording) return;
 
   clearTimeout(state.finalizeTimer);
+  clearTimeout(state.restartTimer);
   state.finalizeTimer = null;
+  state.restartTimer = null;
   state.finalizePending = false;
   state.isRecording = false;
 
@@ -428,7 +582,9 @@ function finalizeRecording() {
 /** Stops recording without translating (used for errors). */
 function abortRecording() {
   clearTimeout(state.finalizeTimer);
+  clearTimeout(state.restartTimer);
   state.finalizeTimer = null;
+  state.restartTimer = null;
   state.finalizePending = false;
   cleanupRecordingResources();
 }
@@ -448,6 +604,8 @@ function cleanupRecordingResources() {
   state.isRecording = false;
   state.isStarting = false;
   state.finalizePending = false;
+  clearTimeout(state.restartTimer);
+  state.restartTimer = null;
   stopRecognition();
   stopWaveform();
   setListeningUI(false);
@@ -1391,6 +1549,18 @@ function initEventListeners() {
     else if (state.systemThemeMedia.addListener) state.systemThemeMedia.addListener(onSystemChange);
   }
 
+  // Diagnostics
+  if (elements.diagRefreshBtn) {
+    elements.diagRefreshBtn.addEventListener('click', () => {
+      queryMicPermission().then(renderDiagnostics);
+    });
+  }
+  if (elements.diagCopyBtn) {
+    elements.diagCopyBtn.addEventListener('click', () => {
+      copyTextToClipboard(elements.diagOutput.textContent, elements.diagCopyBtn);
+    });
+  }
+
   // Connectivity
   window.addEventListener('online', handleConnectionChange);
   window.addEventListener('offline', handleConnectionChange);
@@ -1419,6 +1589,8 @@ function initApp() {
   loadHistory();
   initSpeechRecognition();
   initEventListeners();
+  queryMicPermission();
+  logDiag('App initialized');
 
   updateCharCount();
   updateActionButtons();

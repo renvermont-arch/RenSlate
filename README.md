@@ -21,6 +21,13 @@ Optional server environment variables: `PORT`, `HOST`, `NO_OPEN=1` (disable auto
 - Offline app shell via a service worker, plus an installable PWA manifest and icons.
 - Dark / Light / System themes and keyboard-accessible controls.
 
+## Voice input on a phone (important)
+
+- Web Speech Recognition and the microphone **only work on HTTPS** (or `localhost`). Installing from a plain `http://192.168.x.x` address will silently break voice input. Use an HTTPS tunnel (for example Cloudflare Tunnel or ngrok) or serve over HTTPS.
+- Chrome/Android ends speech sessions early. The app now automatically restarts the session while the mic button is active, so keep holding the conversation until you tap stop.
+- Speech recognition sends audio to Google's service, so the phone needs an internet connection. `network` errors mean connectivity, not a code bug.
+- If voice still fails, open **Settings → Speech Diagnostics**, tap the mic once, and copy the report. It shows secure-context status, permission state, the real browser error code, and recognition events.
+
 ## Notes
 
 - Translation requires an internet connection; the app shell is cached for offline use.
