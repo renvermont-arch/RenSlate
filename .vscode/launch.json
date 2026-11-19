@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "chrome",
+      "request": "launch",
+      "name": "Run Voice Translator (Auto-Starts Local Server)",
+      "url": "http://localhost:8080/index.html",
+      "webRoot": "${workspaceFolder}",
+      "preLaunchTask": "start-server"
+    },
+    {
+      "type": "chrome",
+      "request": "launch",
+      "name": "Launch Chrome with VS Code Live Server (Port 5500)",
+      "url": "http://127.0.0.1:5500/index.html",
+      "webRoot": "${workspaceFolder}"
+    }
+  ]
+}
